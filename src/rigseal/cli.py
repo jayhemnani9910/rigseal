@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from rigseal import __version__
 from rigseal import lock as lk
 from rigseal import hook_config, hooks, rules, sarif, signing
 from rigseal import watch as wt
@@ -43,8 +44,19 @@ AllowedSignersOpt = Annotated[
 ]
 
 
+def _version(value: bool) -> None:
+    if value:
+        out.print(__version__, highlight=False)
+        raise typer.Exit()
+
+
 @app.callback()
-def main() -> None:
+def main(
+    version: Annotated[
+        bool | None,
+        typer.Option("--version", help="Print the version and exit.", callback=_version, is_eager=True),
+    ] = None,
+) -> None:
     """A lockfile for your AI agent setup."""
 
 
