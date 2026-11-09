@@ -16,6 +16,8 @@ COPILOT = "copilot-cli"
 def vscode_user_dir(home: Path) -> Path:
     if sys.platform == "darwin":
         return home / "Library" / "Application Support" / "Code" / "User"
+    if sys.platform == "win32":
+        return home / "AppData" / "Roaming" / "Code" / "User"
     return home / ".config" / "Code" / "User"
 
 

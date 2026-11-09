@@ -196,6 +196,13 @@ def test_vscode_mac_path(tmp_path, monkeypatch):
     assert vscode.vscode_user_dir(tmp_path) == tmp_path / "Library/Application Support/Code/User"
 
 
+def test_vscode_windows_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(vscode.sys, "platform", "win32")
+    assert vscode.vscode_user_dir(tmp_path) == tmp_path / "AppData/Roaming/Code/User"
+    write(tmp_path / "AppData/Roaming/Code/User/mcp.json", json.dumps({"servers": {"gh": {"command": "gh-mcp"}}}))
+    assert rows(vscode.collect(tmp_path, None)) == {("vscode", "user", "mcp", "gh")}
+
+
 def test_empty_home_gives_nothing(tmp_path):
     for collect in (codex.collect, cursor.collect, vscode.collect, shared.collect):
         assert collect(tmp_path, tmp_path) == []
