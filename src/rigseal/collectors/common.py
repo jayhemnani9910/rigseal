@@ -6,8 +6,16 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
-from rigseal.model import FileHash, Item, hash_bytes, hash_file, hash_json, hash_tree
+from rigseal.model import CollectError, FileHash, Item, hash_bytes, hash_file, hash_json, hash_tree
 from rigseal.readers import read_json
+
+
+def children(folder: Path) -> list[Path]:
+    """The entries of a folder, sorted. One that can't be listed is an error to show, not a crash."""
+    try:
+        return sorted(folder.iterdir())
+    except OSError as e:
+        raise CollectError(f"cannot read {folder}: {e}") from e
 
 
 def escapes(path: Path, within: Path | None) -> bool:
@@ -33,12 +41,12 @@ def single_file(agent: str, path: Path, scope: str, kind: str, name: str, detail
     return Item(agent, scope, kind, name, str(path), digest, [FileHash(path.name, digest)], details or {})
 
 
-def optional_file(agent: str, path: Path, scope: str, kind: str, within: Path | None = None) -> list[Item]:
+def optional_file(agent: str, path: Path, scope: str, kind: str, within: Path | None = None, name: str | None = None) -> list[Item]:
     if escapes(path, within):
-        return [link_item(agent, path, scope, kind, path.name)]
+        return [link_item(agent, path, scope, kind, name or path.name)]
     if not path.is_file():
         return []
-    return [single_file(agent, path, scope, kind, path.name)]
+    return [single_file(agent, path, scope, kind, name or path.name)]
 
 
 def files_matching(agent: str, root: Path, suffix: str, kind: str, scope: str, within: Path | None = None) -> list[Item]:
@@ -71,12 +79,14 @@ def mcp_item(agent: str, name: str, cfg: object, scope: str, where: Path) -> Ite
         transport = cfg.get("type") or ("stdio" if "command" in cfg else "http" if "url" in cfg else "unknown")
         details["transport"] = str(transport)
         if "command" in cfg:
-            details["command"] = str(cfg["command"])
+            # Some configs put the whole command line here. Keep the program only: what follows can hold secrets.
+            words = str(cfg["command"]).split(None, 1)
+            details["command"] = (words[0] + (" ..." if len(words) > 1 else "")) if words else ""
             args = cfg.get("args")
             details["arg_count"] = len(args) if isinstance(args, list) else 0
         if "url" in cfg:
             try:
-                details["host"] = urlparse(str(cfg["url"])).netloc
+                details["host"] = urlparse(str(cfg["url"])).netloc.rpartition("@")[2]  # never the user:password part
             except ValueError:
                 details["host"] = "invalid url"
         for key in ("env", "headers", "http_headers"):
@@ -117,28 +127,32 @@ def skill_dirs(agent: str, root: Path, scope: str, skip: tuple[str, ...] = (), k
         return []
     return [
         skill_item(agent, d, scope, kind, within)
-        for d in sorted(root.iterdir())
+        for d in children(root)
         if d.name not in skip and (d.is_dir() or escapes(d, within))
     ]
 
 
+def _servers_in(path: Path) -> dict:
+    """The servers in a .mcp.json-style file: under `mcpServers`, or the whole file when that wrapper is left out."""
+    doc = read_json(path) or {}
+    wrapped = doc.get("mcpServers")
+    return wrapped if isinstance(wrapped, dict) else {n: c for n, c in doc.items() if isinstance(c, dict)}
+
+
 def plugin_mcp(agent: str, plugin_dir: Path, plugin: str) -> list[Item]:
-    """MCP servers a plugin ships: `.mcp.json` at its root, or what `.claude-plugin/plugin.json` points to
-    (a relative path, or the servers inline). Named `plugin:server`, as the agents show them."""
-    sources: list[tuple[Path, object]] = []
-    manifest = read_json(plugin_dir / ".claude-plugin" / "plugin.json") or {}
-    declared = manifest.get("mcpServers")
-    if isinstance(declared, dict):
-        sources.append((plugin_dir / ".claude-plugin" / "plugin.json", declared))
-    elif isinstance(declared, str):
-        path = (plugin_dir / declared).resolve()
-        if path.is_relative_to(plugin_dir.resolve()):
-            sources.append((path, (read_json(path) or {}).get("mcpServers")))
-    else:
-        path = plugin_dir / ".mcp.json"
-        sources.append((path, (read_json(path) or {}).get("mcpServers")))
-    items = []
-    for where, servers in sources:
-        if isinstance(servers, dict):
-            items += [mcp_item(agent, f"{plugin}:{n}", c, "plugin", where) for n, c in sorted(servers.items())]
-    return items
+    """MCP servers a plugin ships. Claude Code reads `.mcp.json` at the plugin root first, then what
+    `.claude-plugin/plugin.json` lists under `mcpServers`: a .json path, an inline map, or a list of those.
+    A later server replaces an earlier one of the same name. Named `plugin:server`, as the agents show them.
+    Packaged bundles (.mcpb, .dxt, URLs) are not opened: the plugin's own hash covers a bundle file."""
+    manifest = plugin_dir / ".claude-plugin" / "plugin.json"
+    declared = (read_json(manifest) or {}).get("mcpServers")
+    root = plugin_dir / ".mcp.json"
+    found: dict[str, tuple[Path, object]] = {n: (root, c) for n, c in _servers_in(root).items()}
+    for shape in declared if isinstance(declared, list) else [declared]:
+        if isinstance(shape, dict):
+            found.update({n: (manifest, c) for n, c in shape.items()})
+        elif isinstance(shape, str) and shape.lower().endswith(".json"):
+            path = (plugin_dir / shape).resolve()
+            if path.is_relative_to(plugin_dir.resolve()):
+                found.update({n: (path, c) for n, c in _servers_in(path).items()})
+    return [mcp_item(agent, f"{plugin}:{n}", c, "plugin", where) for n, (where, c) in sorted(found.items())]

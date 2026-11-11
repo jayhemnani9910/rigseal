@@ -198,3 +198,61 @@ def test_setup_keeps_an_existing_signer_list(env, tmp_path):
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)], check=True)
     cli(env, "setup", "--key", str(key))
     assert (home / ".rigseal/allowed_signers").read_text() == "someone@example.com ssh-ed25519 AAAA\n"
+
+
+def test_setup_makes_the_mcp_hook_fail_closed(env):
+    """Without onFailure, a hook that crashes, times out or can't start lets the MCP call through."""
+    home, _ = env
+    cli(env, "setup", "--no-sign")
+    hooks = settings(home)["hooks"]
+    assert hooks["PreToolUse"][1]["hooks"][0]["onFailure"] == "block"
+    assert "onFailure" not in hooks["SessionStart"][0]["hooks"][0]
+
+
+def test_setup_brings_an_older_hook_up_to_date(env):
+    """Hooks installed before onFailure existed are changed in place, not added a second time."""
+    home, _ = env
+    cli(env, "setup", "--no-sign")
+    doc = settings(home)
+    mine = doc["hooks"]["PreToolUse"][1]["hooks"][0]
+    del mine["onFailure"]
+    mine["timeout"] = 60  # the user's own choice stays
+    write(home / ".claude/settings.json", json.dumps(doc))
+    assert "out of date" in cli(env, "status").output
+    r = cli(env, "setup", "--no-sign")
+    assert r.exit_code == 0 and "update claude-code hooks" in r.output
+    after = settings(home)["hooks"]["PreToolUse"]
+    assert len(after) == 2
+    assert after[1]["hooks"][0] == {"type": "command", "command": "rigseal hook claude-code", "timeout": 60, "onFailure": "block"}
+    assert "claude-code on" in cli(env, "status").output
+
+
+def test_setup_with_the_key_itself_in_git_config_does_not_sign(env, tmp_path):
+    """1Password sets user.signingkey to the public key, not to a file. Setup works and leaves the locks unsigned."""
+    home, _ = env
+    write(tmp_path / "gitconfig", "[user]\n\temail = dev@example.com\n\tsigningkey = ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKexample\n[gpg]\n\tformat = ssh\n")
+    r = cli(env, "setup")
+    assert r.exit_code == 0, r.output
+    assert (home / ".rigseal/machine.lock").exists() and not (home / ".rigseal/machine.lock.sig").exists()
+
+
+def test_setup_with_a_key_it_cannot_read_changes_nothing(env, tmp_path):
+    home, _ = env
+    before = (home / ".claude/settings.json").read_text()
+    r = cli(env, "setup", "--key", str(tmp_path / "no-such-key"))
+    assert r.exit_code == 2
+    assert (home / ".claude/settings.json").read_text() == before and not (home / ".rigseal").exists()
+
+
+@pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
+def test_signer_list_is_written_only_once_signing_worked(env, tmp_path, monkeypatch):
+    """A list with no signed lock behind it would make every later unsigned lock fail."""
+    home, _ = env
+    key = tmp_path / "k"
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "dev@example.com", "-f", str(key)], check=True)
+    key.unlink()  # only the public half is left, and no ssh-agent holds the private one
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    r = cli(env, "setup", "--key", str(key) + ".pub")
+    assert r.exit_code == 2 and not (home / ".rigseal/allowed_signers").exists()
+    assert cli(env, "setup", "--no-sign").exit_code == 0
+    assert cli(env, "check").exit_code == 0

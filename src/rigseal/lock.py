@@ -20,6 +20,7 @@ from rigseal.model import CollectError, Item
 
 LOCK_VERSION = 0
 REPO_LOCK_NAME = "rigseal.lock"
+MAX_REPO_LOCK_BYTES = 64 * 1024 * 1024  # a repo lock arrives with a clone: don't read whatever size it claims
 
 
 def rigseal_dir(home: Path) -> Path:
@@ -117,9 +118,16 @@ class Lock:
 
     def write(self, sign: Callable[[Path], Path] | None = None) -> None:
         """Write the lock. With `sign`, a temp copy is signed first, so a failed signing leaves the old lock and .sig."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(self.to_json())
+        text, tmp = self.to_json(), self.path.with_name(self.path.name + ".tmp")
+        if self.path.name == REPO_LOCK_NAME and len(text) > MAX_REPO_LOCK_BYTES:  # never write a lock we would refuse to read
+            raise CollectError(f"{self.path} would be over {MAX_REPO_LOCK_BYTES // 2**20} MB: this project's agent folders hold too many files to lock")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.unlink(missing_ok=True)  # a link a repo left under this name is removed, never written through
+            with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666), "w") as f:  # O_EXCL follows no link
+                f.write(text)
+        except OSError as e:
+            raise CollectError(f"cannot write {self.path}: {e}") from e
         try:
             signature = sign(tmp) if sign else None
             tmp.replace(self.path)
@@ -130,8 +138,14 @@ class Lock:
             tmp.with_name(tmp.name + ".sig").unlink(missing_ok=True)
 
 
-def read_lock(path: Path) -> Lock | None:
+def read_lock(path: Path, repo: bool = False) -> Lock | None:
+    """The lock at `path`, None if there is none. With `repo` the file arrived with a clone, so it has to be a plain
+    file of a sane size that holds project-level entries only."""
     try:
+        if (repo and path.is_symlink()) or (path.exists() and not path.is_file()):
+            raise CollectError(f"{path} is not a regular file; not reading it")
+        if repo and path.stat().st_size > MAX_REPO_LOCK_BYTES:
+            raise CollectError(f"{path} is over {MAX_REPO_LOCK_BYTES // 2**20} MB; not reading it")
         doc = json.loads(path.read_text())
     except FileNotFoundError:
         return None
@@ -143,11 +157,18 @@ def read_lock(path: Path) -> Lock | None:
     valid = _valid_entries(items) and isinstance(projects, dict) and all(_valid_entries(p) for p in projects.values())
     if not valid or not isinstance(signed_by, str | None):
         raise CollectError(f"{path}: malformed lockfile entries")
+    if repo and (projects or any(key.split("/")[1] != "project" for key in items)):
+        raise CollectError(f"{path}: a repo lock can only hold project-level entries")
     return Lock(path, items, projects, signed_by)
 
 
 def _valid_entries(entries: object) -> bool:
-    return isinstance(entries, dict) and all(_valid_entry(e) for e in entries.values())
+    return isinstance(entries, dict) and all(_valid_key(k) and _valid_entry(e) for k, e in entries.items())
+
+
+def _valid_key(key: object) -> bool:
+    """agent/scope/kind/name, each part present. The name may hold more slashes."""
+    return isinstance(key, str) and len(parts := key.split("/", 3)) == 4 and all(parts)
 
 
 def _valid_entry(e: object) -> bool:
@@ -157,7 +178,14 @@ def _valid_entry(e: object) -> bool:
     if not isinstance(e.get("files", {}), dict) or not isinstance(details, dict):
         return False
     caps = details.get("capabilities") or {}
-    return isinstance(caps, dict) and all(isinstance(v, bool | list | dict) for v in caps.values())
+    return isinstance(caps, dict) and all(_valid_capability(k, v) for k, v in caps.items())
+
+
+def _valid_capability(name: str, value: object) -> bool:
+    """A flag, a list of strings, or for hidden_chars a map per file: the shapes `capability_diff` reads."""
+    if name == "hidden_chars":
+        return isinstance(value, dict)
+    return isinstance(value, bool) or (isinstance(value, list) and all(isinstance(v, str) for v in value))
 
 
 # --- diff --------------------------------------------------------------------

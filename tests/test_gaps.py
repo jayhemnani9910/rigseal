@@ -9,6 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from rigseal import model
+from rigseal.cache import Cache, analysis_version
 from rigseal.cli import app
 from rigseal.collectors import claude_code, codex, common
 from rigseal.model import CollectError
@@ -246,3 +247,142 @@ def test_dogfood_report_counts_each_pending_change_once(tmp_path, monkeypatch, c
     assert "2 distinct drift events, 2.0 per week" in out
     assert "auto-update     1" in out and "1 events had rule findings" in out
     assert dogfood.classify({"key": "codex/plugin/mcp/gh:github"}) == "auto-update"
+
+
+# --- wrong shapes, secrets and folders the agents read -------------------------
+
+
+def make_plugin(home: Path, name: str, manifest: dict | None = None, files: dict | None = None) -> Path:
+    root = home / ".claude/plugins/cache/m" / name / "1.0"
+    root.mkdir(parents=True)
+    if manifest is not None:
+        write(root / ".claude-plugin/plugin.json", json.dumps({"name": name, **manifest}))
+    for rel, doc in (files or {}).items():
+        write(root / rel, json.dumps(doc))
+    return root
+
+
+def test_plugin_mcp_in_every_form_claude_code_reads(tmp_path):
+    """`.mcp.json` at the plugin root is read first, then what the manifest lists: a path, a map, or a list of both."""
+    home, node = tmp_path, {"command": "node"}
+    roots = {
+        "flat": make_plugin(home, "flat", {}, {".mcp.json": {"db": node}}),  # no mcpServers wrapper
+        "both": make_plugin(home, "both", {"mcpServers": {"inline": node}}, {".mcp.json": {"mcpServers": {"fromfile": node}}}),
+        "arr": make_plugin(home, "arr", {"mcpServers": ["./mcp/s.json", {"inl": node}]}, {"mcp/s.json": {"mcpServers": {"viaarray": node}}}),
+        "path": make_plugin(home, "path", {"mcpServers": "./s.json"}, {"s.json": {"viapath": node}, ".mcp.json": {"mcpServers": {"rootfile": node}}}),
+        "later": make_plugin(home, "later", {"mcpServers": {"same": {"command": "second"}}}, {".mcp.json": {"mcpServers": {"same": {"command": "first"}}}}),
+        "bundle": make_plugin(home, "bundle", {"mcpServers": "./db.mcpb"}),
+    }
+    (roots["bundle"] / "db.mcpb").write_bytes(b"PK\x03\x04\xff\xfe not json")  # a packaged server: not opened, and no error
+    installs = {f"{n}@m": [{"installPath": str(p), "version": "1.0"}] for n, p in roots.items()}
+    write(home / ".claude/plugins/installed_plugins.json", json.dumps({"plugins": installs}))
+    items = claude_code.collect(home, None)
+    names = ("flat:db", "both:inline", "both:fromfile", "arr:viaarray", "arr:inl", "path:viapath", "path:rootfile", "later:same")
+    assert rows(items, "mcp") == {("plugin", n) for n in names}
+    assert next(i for i in items if i.name == "later:same").details["command"] == "second"
+
+
+@pytest.mark.parametrize("record", [{"version": "1"}, {"installPath": "", "version": "1"}, {"installPath": "relative/dir", "version": "1"}])
+def test_install_record_without_a_usable_path_is_missing_not_the_current_folder(tmp_path, monkeypatch, record):
+    home, here = tmp_path / "home", tmp_path / "here"
+    write(here / "relative/dir/notes.txt", "x")
+    monkeypatch.chdir(here)
+    write(home / ".claude/plugins/installed_plugins.json", json.dumps({"plugins": {"p@m": [record]}}))
+    [item] = claude_code.collect(home, None)
+    assert item.details["missing"] is True and item.files == []
+
+
+@pytest.mark.parametrize("plugins", [[], {"p@m": "x"}, {"p@m": ["x", 5, None]}, {"p@m": {"version": "1"}}])
+def test_odd_install_records_do_not_crash(tmp_path, plugins):
+    write(tmp_path / ".claude/plugins/installed_plugins.json", json.dumps({"plugins": plugins}))
+    assert all(i.details.get("missing") for i in claude_code.collect(tmp_path, None))
+
+
+@pytest.mark.parametrize("doc", [{"projects": "x"}, {"projects": {"PROJECT": 5}}, {"projects": {"PROJECT": {"mcpServers": []}}}, {"mcpServers": []}])
+def test_odd_claude_json_does_not_crash(tmp_path, doc):
+    home, project = tmp_path / "home", tmp_path / "proj"
+    project.mkdir()
+    write(home / ".claude.json", json.dumps(doc).replace("PROJECT", str(project)))
+    assert claude_code.collect(home, project) == []
+
+
+def test_secrets_in_a_url_or_a_command_line_stay_out_of_details(tmp_path):
+    servers = {
+        "api": {"type": "http", "url": "https://svc-user:tok_live_9f8e@mcp.example.com:8443/mcp?key=abc"},
+        "pg": {"command": "npx -y server-postgres postgresql://admin:S3cret@db.internal/prod"},
+        "plain": {"command": "/opt/tools/server", "args": ["--token", "S3cret"]},
+    }
+    write(tmp_path / ".claude.json", json.dumps({"mcpServers": servers}))
+    items = {i.name: i for i in claude_code.collect(tmp_path, None)}
+    assert items["api"].details["host"] == "mcp.example.com:8443"
+    assert items["pg"].details["command"] == "npx ..."
+    assert items["plain"].details["command"] == "/opt/tools/server"
+    shown = json.dumps([i.to_dict() for i in items.values()])
+    assert "S3cret" not in shown and "tok_live" not in shown
+
+
+def test_json_with_a_byte_order_mark_is_read(tmp_path):
+    f = tmp_path / "mcp.json"
+    f.write_bytes(b"\xef\xbb\xbf" + json.dumps({"servers": {"gh": {"command": "gh-mcp"}}}).encode())
+    assert read_json(f) == {"servers": {"gh": {"command": "gh-mcp"}}}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can list any folder")
+def test_a_folder_that_cannot_be_listed_is_an_error_not_a_crash(tmp_path):
+    skills = tmp_path / ".claude/skills"
+    write(skills / "pdf/SKILL.md", "# pdf")
+    skills.chmod(0)
+    try:
+        with pytest.raises(CollectError):
+            claude_code.collect(tmp_path, None)
+    finally:
+        skills.chmod(0o755)
+
+
+def test_claude_rules_and_the_memory_file_in_dot_claude_are_tracked(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "proj"
+    write(home / ".claude/rules/style.md", "be brief")
+    write(project / ".claude/rules/api/rest.md", "use nouns")
+    write(project / ".claude/CLAUDE.md", "project memory")
+    write(project / "CLAUDE.md", "root memory")
+    items = claude_code.collect(home, project)
+    assert rows(items, "rule") == {("user", "style"), ("project", "api/rest")}
+    assert rows(items, "instructions") == {("project", "CLAUDE.md"), ("project", ".claude/CLAUDE.md")}
+
+
+def test_codex_config_with_odd_values_is_ignored_or_an_error_not_a_crash(tmp_path):
+    write(tmp_path / ".codex/config.toml", "plugins = 5\n")
+    write(tmp_path / ".codex/plugins/cache/m/p/1.0/x.md", "x")
+    assert rows(codex.collect(tmp_path, None), "plugin") == {("plugin", "p@m")}
+    write(tmp_path / ".codex/config.toml", "n = " + "9" * 5000 + "\n")
+    with pytest.raises(CollectError):
+        codex.collect(tmp_path, None)
+
+
+def test_a_folder_linked_under_many_names_is_hashed_once_per_scan(tmp_path, monkeypatch):
+    home, project = tmp_path / "home", tmp_path / "proj"
+    write(project / "assets/data/a.md", "x")
+    (project / ".claude/skills").mkdir(parents=True)
+    for i in range(30):
+        (project / f".claude/skills/s{i}").symlink_to("../../assets/data")
+    calls = []
+    real = model._hash_tree
+    monkeypatch.setattr(model, "_hash_tree", lambda root, ignore: calls.append(root) or real(root, ignore))
+    r = CliRunner().invoke(app, ["status", "--json", "--home", str(home), "-p", str(project)])
+    assert len(json.loads(r.stdout)) == 30 and len(calls) == 1
+
+
+def test_a_damaged_analysis_cache_is_dropped_entry_by_entry(tmp_path):
+    path = tmp_path / "analysis.json"
+    entries = {
+        "a:.md": {"hits": [["R10", "high", "reverse shell pattern"]], "shell": True},
+        "b:.md": 5,
+        "c:.md": {"hits": [["R10", "urgent", "x"]]},
+        "d:.md": {"hits": "x"},
+        "e:.md": {"hosts": [1]},
+        "f:.md": {"hidden": {"tag": "many"}},
+    }
+    path.write_text(json.dumps({"version": analysis_version(), "entries": entries}))
+    assert set(Cache(path).entries) == {"a:.md"}
+    path.write_text(json.dumps({"version": analysis_version(), "entries": ["x"]}))
+    assert Cache(path).entries == {}

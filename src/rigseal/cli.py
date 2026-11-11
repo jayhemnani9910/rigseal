@@ -22,14 +22,18 @@ from rigseal import watch as wt
 from rigseal.cache import Cache, cache_path
 from rigseal.capabilities import enrich
 from rigseal.collectors import AGENTS_OF, COLLECTORS
-from rigseal.model import CollectError, Finding, Item
+from rigseal.model import CollectError, Finding, Item, one_scan
 from rigseal.signing import SignError
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
-out = Console()
-err = Console(stderr=True)
+# soft_wrap: the terminal wraps long lines, so a path is never cut in two by a line break we added.
+out = Console(soft_wrap=True)
+err = Console(stderr=True, soft_wrap=True)
 
-ProjectOpt = Annotated[Path, typer.Option("--project", "-p", help="Project folder to inspect.", exists=True, file_okay=False)]
+ProjectOpt = Annotated[
+    Path | None,
+    typer.Option("--project", "-p", help="Project folder to inspect (default: the repo you are in).", exists=True, file_okay=False),
+]
 HomeOpt = Annotated[Path, typer.Option(hidden=True)]
 JsonOpt = Annotated[bool, typer.Option("--json", help="Print JSON.")]
 SarifOpt = Annotated[bool, typer.Option("--sarif", help="Print SARIF 2.1.0 (for GitHub code scanning).")]
@@ -49,23 +53,28 @@ def main() -> None:
 
 
 def safe(text: object) -> str:
-    """For printing anything that comes from a config or repo: it can't act as Rich markup or break the terminal encoding."""
-    return escape(str(text).encode("utf-8", "backslashreplace").decode())
+    """For printing anything that comes from a config or repo: it can't act as Rich markup, break the terminal
+    encoding, or drive the terminal. Control and invisible characters (escape codes, newlines, bidi marks) show as escapes."""
+    plain = str(text).encode("utf-8", "backslashreplace").decode()
+    return escape("".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode() for ch in plain))
 
 
-def inventory(home: Path, project: Path | None, errors: dict[str, str] | None = None) -> list[Item]:
-    """Everything the agents load. With `errors`, an agent whose config can't be read is recorded there and skipped."""
+def inventory(home: Path, project: Path | None, errors: dict[str, str] | None = None, files: bool = True) -> list[Item]:
+    """Everything the agents load. With `errors`, an agent whose config can't be read is recorded there and skipped.
+    Without `files`, only config files are read: enough for MCP servers, and nothing else in the result can be trusted."""
     items: list[Item] = []
-    for collect in COLLECTORS:
-        try:
-            items += collect(home, project)
-        except Exception as e:
-            if errors is None:
-                raise
-            errors.update(dict.fromkeys(AGENTS_OF[collect], str(e) or type(e).__name__))
-    cache = Cache(cache_path(home))
-    enrich(items, cache)
-    cache.save()
+    with one_scan(files):
+        for collect in COLLECTORS:
+            try:
+                items += collect(home, project)
+            except Exception as e:
+                if errors is None:
+                    raise
+                errors.update(dict.fromkeys(AGENTS_OF[collect], str(e) or type(e).__name__))
+    if files:
+        cache = Cache(cache_path(home))
+        enrich(items, cache)
+        cache.save()
     return items
 
 
@@ -74,9 +83,22 @@ def _fail(message: str) -> typer.Exit:
     return typer.Exit(2)
 
 
-def _paths(home: Path, project: Path) -> tuple[Path, Path | None]:
-    """Resolve paths. The project is None when it is the home folder itself, so user config isn't counted twice."""
-    home, project = home.expanduser().resolve(), project.resolve()
+def project_root(start: Path, home: Path) -> Path:
+    """You or the agent may be in a subfolder; the project's lock and config live at its top."""
+    start, home = start.resolve(), home.expanduser().resolve()
+    for folder in (start, *start.parents):
+        if folder == home:
+            break
+        if (folder / lk.REPO_LOCK_NAME).exists() or (folder / ".git").exists():
+            return folder
+    return start
+
+
+def _paths(home: Path, project: Path | None) -> tuple[Path, Path | None]:
+    """Resolve paths. Without --project, the project is the repo around the current folder, as it is for the hooks.
+    The project is None when it is the home folder itself, so user config isn't counted twice."""
+    home = home.expanduser().resolve()
+    project = project_root(Path.cwd(), home) if project is None else project.resolve()
     return home, None if project == home else project
 
 
@@ -94,15 +116,15 @@ class Ctx:
         return str(self.project) if self.project else ""
 
 
-def _load(home: Path, project: Path, errors: dict[str, str] | None = None) -> Ctx:
+def _load(home: Path, project: Path | None, errors: dict[str, str] | None = None, files: bool = True) -> Ctx:
     home, proj = _paths(home, project)
-    items = inventory(home, proj, errors)
-    repo = lk.read_lock(lk.repo_lock_path(proj)) if proj else None
+    items = inventory(home, proj, errors, files)
+    repo = lk.read_lock(lk.repo_lock_path(proj), repo=True) if proj else None
     machine = lk.read_lock(lk.machine_lock_path(home))
     return Ctx(home, proj, items, lk.split(items, home, proj or home), repo, machine)
 
 
-def load(home: Path, project: Path) -> Ctx:
+def load(home: Path, project: Path | None) -> Ctx:
     try:
         return _load(home, project)
     except CollectError as e:
@@ -140,17 +162,22 @@ def changes(ctx: Ctx, repo_only: bool) -> list[lk.Change]:
 
 def drift(ctx: Ctx) -> tuple[list[lk.Change], str | None]:
     """All drift, for hooks and watch. Without a machine lock rigseal is not set up: nothing is checked, a note says so."""
-    machine = ctx.machine
-    if machine is None:
-        return [], f"rigseal is not set up (no {lk.machine_lock_path(ctx.home)}); run `rigseal init`."
-    problems = []
-    if ctx.repo and ctx.project and (bad := lock_problems(ctx, ctx.repo, False)):  # a lock that fails its signature approves nothing
-        problems += bad
-        ctx.repo = lk.Lock(ctx.repo.path)
-    if bad := lock_problems(ctx, machine, False):
-        problems += bad
-        ctx.machine = lk.Lock(machine.path)
+    if ctx.machine is None:
+        return [], f"rigseal is not set up (no {lk.machine_lock_path(ctx.home)}); run `rigseal setup`."
+    problems = distrust(ctx)
     return changes(ctx, repo_only=False), "; ".join(problems) or None
+
+
+def distrust(ctx: Ctx) -> list[str]:
+    """A lock that fails its signature approves nothing: empty it here, so everything it listed shows as a change.
+    Returns what was wrong. The emptied lock still says it was signed, so approving can't quietly drop signing."""
+    problems = []
+    for name in ("repo", "machine"):
+        lock = getattr(ctx, name)
+        if lock and (bad := lock_problems(ctx, lock, False)):
+            problems += bad
+            setattr(ctx, name, lk.Lock(lock.path, signed_by=lock.signed_by))
+    return problems
 
 
 def item_paths(ctx: Ctx) -> dict[str, str]:
@@ -171,12 +198,15 @@ def lock_problems(ctx: Ctx, lock: lk.Lock, require: bool, allowed: Path | None =
     """Signature problems of one lock. A list inside the repo can be edited along with the lock, so the repo lock
     must also pass a list from outside it when there is one."""
     machine_list = lk.rigseal_dir(ctx.home) / "allowed_signers"
-    project = ctx.project if lock is ctx.repo else None
+    project = ctx.project if ctx.project and lock.path == lk.repo_lock_path(ctx.project) else None
     named = allowed or (Path(v).expanduser() if (v := os.environ.get("RIGSEAL_ALLOWED_SIGNERS")) else None)
     outside = (named or (machine_list if machine_list.is_file() else None)) if project else None
     signers = signing.allowed_signers_for(project / ".rigseal" / "allowed_signers" if project else machine_list, ctx.project)
 
-    if not lock.sig_path.exists():
+    sig = lock.sig_path
+    if sig.is_symlink() or (sig.exists() and (not sig.is_file() or sig.stat().st_size > MAX_SIG_BYTES)):
+        return [f"{sig} is not a signature file"]
+    if not sig.exists():
         if lock.signed_by:
             return [f"{lock.path} says it is signed by {lock.signed_by} but {lock.sig_path.name} is missing"]
         if require or signers.is_file() or (project and named):  # once signers are set up, unsigned is not ok
@@ -204,6 +234,7 @@ def signature_problems(ctx: Ctx, repo_only: bool, require: bool, allowed: Path |
     return problems
 
 
+MAX_SIG_BYTES = 64 * 1024  # an SSH signature is a few hundred bytes
 SEV_STYLE = {"high": "red", "medium": "yellow", "low": "dim"}
 
 
@@ -259,6 +290,12 @@ def _notes(item: Item) -> str:
     return "; ".join(parts)
 
 
+def _hook_state(target: hook_config.Target) -> str:
+    if not hook_config.missing(target):
+        return "[green]on[/green]"
+    return "[yellow]out of date[/yellow], run `rigseal setup`" if hook_config.installed(target) else "[yellow]missing[/yellow]"
+
+
 def _print_summary(ctx: Ctx) -> None:
     by_agent = Counter(i.agent for i in ctx.items)
     out.print(f"{len(ctx.items)} items: " + ", ".join(f"{agent} {n}" for agent, n in sorted(by_agent.items())))
@@ -272,7 +309,7 @@ def _print_summary(ctx: Ctx) -> None:
     counts = Counter(f.severity for f in rules.scan(ctx.items))
     out.print("findings: " + ", ".join(f"{counts[s]} {s}" for s in rules.SEVERITIES) + (", run `rigseal scan`" if counts else ""))
     try:
-        hook_state = [f"{t.agent} {'[yellow]missing[/yellow]' if hook_config.missing(t) else '[green]on[/green]'}" for t in hook_config.targets(ctx.home)]
+        hook_state = [f"{t.agent} {_hook_state(t)}" for t in hook_config.targets(ctx.home)]
     except CollectError as e:
         hook_state = [f"[red]unreadable[/red]: {safe(e)}"]
     if hook_state:
@@ -281,7 +318,7 @@ def _print_summary(ctx: Ctx) -> None:
 
 @app.command()
 def status(
-    project: ProjectOpt = Path("."),
+    project: ProjectOpt = None,
     show_all: Annotated[bool, typer.Option("--all", help="List every item.")] = False,
     as_json: JsonOpt = False,
     home: HomeOpt = Path.home(),
@@ -305,13 +342,13 @@ def status(
         table.add_column(col, overflow="fold")
     for i in items:
         table.add_row(i.agent, i.scope, i.kind, safe(i.name), str(len(i.files)), i.sha256[:12], safe(_notes(i)))
-    out.print(table)
+    out.print(table, soft_wrap=False)
     typer.echo(f"{len(items)} items")
 
 
 @app.command()
 def diff(
-    project: ProjectOpt = Path("."),
+    project: ProjectOpt = None,
     repo_only: RepoOpt = False,
     all_files: Annotated[bool, typer.Option("--files", help="List every file of a changed plugin.")] = False,
     as_json: JsonOpt = False,
@@ -319,11 +356,15 @@ def diff(
 ) -> None:
     """Show what changed since the last approve."""
     ctx = load(home, project)
+    problems = distrust(ctx)
     found = changes(ctx, repo_only)
     findings = change_findings(ctx, found)
     if as_json:
         typer.echo(json.dumps([{**c.to_dict(), **_findings_json(findings, c.key)} for c in found], indent=2))
-    elif found:
+        return
+    for p in problems:
+        out.print(f"[red]signature:[/red] {safe(p)}")
+    if found:
         print_changes(found, findings, all_files)
     else:
         out.print("no drift")
@@ -335,7 +376,7 @@ def _findings_json(findings: dict[str, list[Finding]], key: str) -> dict:
 
 @app.command()
 def check(
-    project: ProjectOpt = Path("."),
+    project: ProjectOpt = None,
     repo_only: RepoOpt = False,
     require_signature: Annotated[bool, typer.Option("--require-signature", help="Fail if a lock is unsigned.")] = False,
     allowed_signers: AllowedSignersOpt = None,
@@ -371,7 +412,8 @@ def _save(lock: lk.Lock, key: Path | None, signer: str) -> str:
         lock.sig_path.unlink(missing_ok=True)
         return f"wrote {safe(lock.path)} [yellow](unsigned)[/yellow]"
     lock.write(lambda path: signing.sign(path, key))
-    return f"wrote and signed {safe(lock.path)}"
+    also = f" (commit {lock.sig_path.name} with it)" if lock.path.name == lk.REPO_LOCK_NAME else ""
+    return f"wrote and signed {safe(lock.path)}{also}"
 
 
 def _approve(ctx: Ctx, keys: set[str] | None, key: Path | None) -> list[str]:
@@ -380,7 +422,7 @@ def _approve(ctx: Ctx, keys: set[str] | None, key: Path | None) -> list[str]:
     if ctx.project and (ctx.repo or ctx.current.repo):
         old = ctx.repo or lk.Lock(lk.repo_lock_path(ctx.project))
         new_items = lk.apply(old.items, ctx.current.repo, keys, who, when)
-        if ctx.repo is None or new_items != old.items:
+        if new_items != old.items:  # nothing of this project approved: leave the repo without a lock
             notes.append(_save(lk.Lock(old.path, new_items), key, who))
 
     old_m = ctx.machine or lk.Lock(lk.machine_lock_path(ctx.home))
@@ -410,19 +452,21 @@ def _require_person() -> None:
         raise _fail("approving needs a person at a terminal.")
 
 
-def _trust_own_key(ctx: Ctx, key: Path | None, no_sign: bool) -> None:
-    """First setup only: with no signer list, locks signed with this key would fail their own check and approve nothing."""
+def _own_signer(ctx: Ctx, key: Path | None, no_sign: bool) -> str | None:
+    """The line that makes ~/.rigseal/allowed_signers trust the key you sign with, when no signer list exists yet.
+    Without one, locks signed with this key would fail their own check and approve nothing. Worked out before
+    anything is written, so a key that can't be read stops the command early."""
     signers = lk.rigseal_dir(ctx.home) / "allowed_signers"
     sign_key = None if no_sign else signing.signing_key(key, ctx.project)
     if sign_key is None or signers.exists():
-        return
+        return None
+    who = signing.identity(ctx.project)
+    if not who.isprintable() or any(ch in who for ch in ' ,*?!"'):  # ssh-keygen reads those as separators or patterns
+        raise _fail(f"can't sign as {who!r} (your git user.email): it has spaces or pattern characters. Fix it, or pass --no-sign.")
     try:
-        line = f'{signing.identity(ctx.project)} namespaces="{signing.NAMESPACE}" {signing.public_key(sign_key)}\n'
+        return f'{who} namespaces="{signing.NAMESPACE}" {signing.public_key(sign_key)}\n'
     except SignError as e:
         raise _fail(str(e)) from e
-    signers.parent.mkdir(parents=True, exist_ok=True)
-    signers.write_text(line)
-    out.print(f"trusting your signing key in {safe(signers)}")
 
 
 def _run_approve(ctx: Ctx, keys: set[str] | None, key: Path | None, no_sign: bool, allow_unsigned: bool) -> None:
@@ -433,16 +477,33 @@ def _run_approve(ctx: Ctx, keys: set[str] | None, key: Path | None, no_sign: boo
             f"{signed[0].path} is signed; approving without a key would drop the signature. "
             "Pass --key, or --allow-unsigned if that is what you want."
         )
+    signer = _own_signer(ctx, key, no_sign)
     try:
         for note in _approve(ctx, keys, sign_key):
             out.print(note)
-    except SignError as e:
+    except (SignError, CollectError) as e:
         raise _fail(str(e)) from e
+    if signer:  # only once the signing worked: a list with no signed lock behind it would fail every later check
+        signers = lk.rigseal_dir(ctx.home) / "allowed_signers"
+        signers.parent.mkdir(parents=True, exist_ok=True)
+        signers.write_text(signer)
+        out.print(f"trusting your signing key in {safe(signers)}")
+    if sign_key:
+        _warn_if_unverifiable(ctx)
+
+
+def _warn_if_unverifiable(ctx: Ctx) -> None:
+    """Say so now if a lock just signed won't pass its own check: a new key or another git email than the signer list knows."""
+    for path in (lk.repo_lock_path(ctx.project) if ctx.project else None, lk.machine_lock_path(ctx.home)):
+        lock = lk.read_lock(path) if path else None
+        for problem in lock_problems(ctx, lock, False) if lock and lock.signed_by else []:
+            out.print(f"[yellow]warning:[/yellow] {safe(problem)}")
+            out.print(f"    The lock is written, but it approves nothing until {safe(lk.rigseal_dir(ctx.home) / 'allowed_signers')} lists the key and email you sign with now (and `.rigseal/allowed_signers` in the repo, if it has one).")
 
 
 @app.command()
 def init(
-    project: ProjectOpt = Path("."),
+    project: ProjectOpt = None,
     force: Annotated[bool, typer.Option("--force", help="Overwrite existing locks.")] = False,
     key: KeyOpt = None,
     no_sign: NoSignOpt = False,
@@ -461,13 +522,12 @@ def init(
         if sign_key is None and not allow_unsigned:
             raise _fail("the existing lock is signed; --force without a key would drop the signature. Pass --key or --allow-unsigned.")
     ctx.repo = ctx.machine = None
-    _trust_own_key(ctx, key, no_sign)
     _run_approve(ctx, None, key, no_sign, allow_unsigned=True)
 
 
 @app.command()
 def setup(
-    project: ProjectOpt = Path("."),
+    project: ProjectOpt = None,
     key: KeyOpt = None,
     no_sign: NoSignOpt = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Don't ask.")] = False,
@@ -486,9 +546,12 @@ def setup(
     if not todo and not fresh:
         out.print("already set up. `rigseal status` shows where things stand.")
         return
+    if fresh:
+        _own_signer(ctx, key, no_sign)  # a signing key that can't be read stops here, before any file changes
 
     for target, events in todo:
-        out.print(f"add {target.agent} hooks to {safe(target.path)}: {', '.join(events)}")
+        verb = "update" if hook_config.installed(target) else "add"
+        out.print(f"{verb} {target.agent} hooks in {safe(target.path)}: {', '.join(events)}")
     if fresh:
         out.print(f"lock the {len(ctx.items)} items your agents load today")
     if not yes and os.environ.get("RIGSEAL_NONINTERACTIVE") != "1" and not typer.confirm("Go ahead?", default=True):
@@ -504,7 +567,6 @@ def setup(
     ctx = load(home, project)  # the settings just changed, and the lock must include the new hooks
     # A repo lock that already exists belongs to the repo's reviewers. Only the machine lock is new.
     keys = (set(ctx.current.machine) | set(ctx.current.local)) if ctx.repo else None
-    _trust_own_key(ctx, key, no_sign)
     _run_approve(ctx, keys, key, no_sign, allow_unsigned=True)
     high = sum(f.severity == "high" for f in rules.scan(ctx.items))
     if high:
@@ -514,7 +576,7 @@ def setup(
 @app.command()
 def approve(
     keys: Annotated[list[str] | None, typer.Argument(help="Item keys to approve (default: all changes).")] = None,
-    project: ProjectOpt = Path("."),
+    project: ProjectOpt = None,
     key: KeyOpt = None,
     no_sign: NoSignOpt = False,
     allow_unsigned: AllowUnsignedOpt = False,
@@ -524,6 +586,7 @@ def approve(
     """Accept the current state into the locks. Shows what you are approving and asks first."""
     _require_person()
     ctx = load(home, project)
+    problems = distrust(ctx)
     pending = changes(ctx, repo_only=False)
     wanted = set(keys) if keys else None
     if wanted and (unknown := wanted - {c.key for c in pending}):
@@ -532,6 +595,8 @@ def approve(
         out.print("nothing to approve")
         return
     if not yes and os.environ.get("RIGSEAL_NONINTERACTIVE") != "1":
+        for p in problems:
+            out.print(f"[red]signature:[/red] {safe(p)}")
         shown = [c for c in pending if wanted is None or c.key in wanted]
         print_changes(shown, change_findings(ctx, shown))
         if not typer.confirm(f"Approve {len(shown)} change(s)?", default=False):
@@ -541,7 +606,7 @@ def approve(
 
 @app.command()
 def scan(
-    project: ProjectOpt = Path("."),
+    project: ProjectOpt = None,
     fail_on: Annotated[str, typer.Option("--fail-on", help="Exit 1 at this severity or worse: high, medium, low, never.")] = "high",
     show_all: Annotated[bool, typer.Option("--all", help="Also show low findings.")] = False,
     as_json: JsonOpt = False,
@@ -576,17 +641,18 @@ def scan(
 
 
 AGENTS = ("claude-code", "cursor")
+GATE_EVENTS = ("PreToolUse", "beforeMCPExecution")  # run before every MCP call: these read config files only
 
 
-def project_root(start: Path, home: Path) -> Path:
-    """The agent may be working in a subfolder; the project's lock and config live at its top."""
-    start, home = start.resolve(), home.expanduser().resolve()
-    for folder in (start, *start.parents):
-        if folder == home:
-            break
-        if (folder / lk.REPO_LOCK_NAME).exists() or (folder / ".git").exists():
-            return folder
-    return start
+def _session_folder(agent: str, payload: dict) -> Path:
+    """The folder the agent's session belongs to. Claude Code's `cwd` follows every `cd`, so the project folder it
+    gives its hooks comes first. Cursor sends its workspace folders."""
+    roots = payload.get("workspace_roots")
+    fixed = os.environ.get("CLAUDE_PROJECT_DIR") if agent == "claude-code" else None
+    for value in (fixed, payload.get("cwd"), roots[0] if isinstance(roots, list) and roots else None):
+        if isinstance(value, str) and value:
+            return Path(value)
+    return Path.cwd()
 
 
 @app.command()
@@ -599,16 +665,19 @@ def hook(
         raise _fail(f"agent must be one of: {', '.join(AGENTS)}")
     try:
         payload = json.loads(sys.stdin.read() or "{}")
-    except ValueError:
-        payload = {}
+    except (ValueError, RecursionError) as e:  # input that can't be read can't be checked; exit code 2 blocks, for both agents
+        typer.echo("rigseal: could not read the hook input, so nothing was checked.", err=True)
+        raise typer.Exit(2) from e
     if not isinstance(payload, dict):
         payload = {}
-    roots = payload.get("workspace_roots") or []
-    where = Path(str(payload.get("cwd") or (roots[0] if roots else "") or Path.cwd()))
     errors: dict[str, str] = {}
+    gate = payload.get("hook_event_name") in GATE_EVENTS
     try:
-        ctx = _load(home, project_root(where, home) if where.is_dir() else home, errors)
+        where = _session_folder(agent, payload)
+        ctx = _load(home, project_root(where, home) if where.is_dir() else home, errors, files=not gate)
         found, note = drift(ctx)
+        if gate:  # no file was hashed, so only what the configs say about MCP servers means anything
+            found = [c for c in found if c.key.split("/", 3)[2:3] == ["mcp"]]
         paths = item_paths(ctx)
         found = [c for c in found if c.key.split("/", 1)[0] not in errors]  # an unreadable agent's items only look removed
         if errors:
@@ -618,10 +687,14 @@ def hook(
         found, note, paths, broken = [], f"rigseal could not check the agent setup: {e}", {}, str(e) or type(e).__name__
     if not lk.machine_lock_path(home.expanduser().resolve()).exists():
         broken = None  # not set up yet: hooks never block
-    if agent == "claude-code":
-        reply, code = hooks.claude_code(payload, found, paths, note, broken)
-    else:
-        reply, code = hooks.cursor(payload, found, note, broken)
+    try:
+        if agent == "claude-code":
+            reply, code = hooks.claude_code(payload, found, paths, note, broken)
+        else:
+            reply, code = hooks.cursor(payload, found, note, broken)
+    except Exception as e:  # a reply that can't be built must not read as "allow"
+        typer.echo(f"rigseal: could not answer the hook: {hooks.show(e, 300)}", err=True)
+        raise typer.Exit(2) from e
     if reply is not None:
         typer.echo(json.dumps(reply))
     raise typer.Exit(code)
@@ -629,7 +702,7 @@ def hook(
 
 @app.command()
 def watch(
-    project: ProjectOpt = Path("."),
+    project: ProjectOpt = None,
     interval: Annotated[float, typer.Option("--interval", help="Seconds between file checks.")] = 0.5,
     rescan: Annotated[float, typer.Option("--rescan", help="Seconds between full checks when no file changed.")] = 30.0,
     home: HomeOpt = Path.home(),

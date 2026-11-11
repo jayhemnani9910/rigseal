@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from functools import cache
 from pathlib import Path
 
 NAMESPACE = "rigseal"
@@ -34,8 +35,8 @@ def signing_key(explicit: Path | None, cwd: Path | None = None) -> Path | None:
     if os.environ.get("RIGSEAL_SIGNING_KEY"):
         return Path(os.environ["RIGSEAL_SIGNING_KEY"]).expanduser()
     if _git_config("gpg.format", cwd) == "ssh" and (key := _git_config("user.signingkey", cwd)):
-        if key.startswith("key::"):
-            return None  # literal key in config; ssh-agent signing is not supported yet
+        if key.startswith(("key::", "ssh-", "ecdsa-", "sk-")):
+            return None  # the key itself, not a file (1Password writes it this way); ssh-agent signing is not supported yet
         return Path(key).expanduser()
     return None
 
@@ -53,10 +54,11 @@ def sign(path: Path, key: Path) -> Path:
     sig.unlink(missing_ok=True)
     out = _ssh_keygen(["-Y", "sign", "-n", NAMESPACE, "-f", str(key), str(path)])
     if out.returncode != 0 or not sig.exists():
-        raise SignError(f"signing {path} with {key} failed: {out.stderr.strip()}")
+        raise SignError(f"signing {path} with {key} failed: {' '.join(out.stderr.split())}")
     return sig
 
 
+@cache  # asked for more than once in a run, and deriving it from a private key can prompt for the passphrase
 def public_key(key: Path) -> str:
     """The public half of `key`: the .pub given or beside it, else derived from the private key."""
     for path in (key, key.with_name(key.name + ".pub")):
@@ -64,7 +66,7 @@ def public_key(key: Path) -> str:
             return path.read_text().strip()
     out = _ssh_keygen(["-y", "-f", str(key)])
     if out.returncode != 0:
-        raise SignError(f"cannot read the public key of {key}: {out.stderr.strip()}")
+        raise SignError(f"cannot read the public key of {key}: {' '.join(out.stderr.split())}")
     return out.stdout.strip()
 
 
@@ -76,7 +78,7 @@ def verify(path: Path, signer: str, allowed_signers: Path) -> None:
     with path.open("rb") as data:
         out = _ssh_keygen(["-Y", "verify", "-f", str(allowed_signers), "-I", signer, "-n", NAMESPACE, "-s", str(sig)], stdin=data)
     if out.returncode != 0:
-        raise SignError(f"bad signature on {path}: {out.stderr.strip() or out.stdout.strip()}")
+        raise SignError(f"bad signature on {path}: {' '.join((out.stderr.strip() or out.stdout).split())}")
 
 
 def allowed_signers_for(default: Path, cwd: Path | None = None) -> Path:

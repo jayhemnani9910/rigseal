@@ -34,7 +34,8 @@ def collect(home: Path, project: Path | None) -> list[Item]:
     config = _config(codex_home / "config.toml", "user", items)
     items += skill_dirs(codex_home / "skills", "user", skip=(".system",))
     items += skill_dirs(codex_home / "skills" / ".system", "system")
-    items += _plugins(codex_home / "plugins" / "cache", (config or {}).get("plugins") or {})
+    enabled = (config or {}).get("plugins")
+    items += _plugins(codex_home / "plugins" / "cache", enabled if isinstance(enabled, dict) else {})
     items += common.files_matching(AGENT, codex_home / "rules", ".rules", "rule", "user")
     items += optional_file(codex_home / "AGENTS.md", "user", "instructions")
 
@@ -59,13 +60,13 @@ def _plugins(cache: Path, enabled: dict) -> list[Item]:
     if not cache.is_dir():
         return []
     items = []
-    for market in sorted(p for p in cache.iterdir() if p.is_dir()):
-        for plugin in sorted(p for p in market.iterdir() if p.is_dir()):
+    for market in (p for p in common.children(cache) if p.is_dir()):
+        for plugin in (p for p in common.children(market) if p.is_dir()):
             name = f"{plugin.name}@{market.name}"
             entry = enabled.get(name)
             details = {"enabled": bool(entry.get("enabled")) if isinstance(entry, dict) else False}
             items.append(common.tree_item(AGENT, plugin, "plugin", "plugin", name, details))
-            for version in sorted(p for p in plugin.iterdir() if p.is_dir()):
+            for version in (p for p in common.children(plugin) if p.is_dir()):
                 for mcp in common.plugin_mcp(AGENT, version, plugin.name):
                     mcp.details["plugin_enabled"] = details["enabled"]
                     mcp.details["version"] = version.name

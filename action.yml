@@ -77,19 +77,23 @@ runs:
             echo "### rigseal: agent config changed without approval"
             echo
             echo '```'
-            cat "$RUNNER_TEMP/rigseal.txt"
+            tr '`' "'" < "$RUNNER_TEMP/rigseal.txt"  # names come from the pull request: they must not close this block
             echo '```'
             echo
             echo "If these changes are intended, run \`rigseal approve\` locally and commit \`rigseal.lock\`."
           fi
         } > "$body"
-        existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
-          --jq '[.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- rigseal -->")))][0].id // empty')
-        if [ -n "$existing" ]; then
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F "body=@$body" > /dev/null
-        elif [ "$CODE" != "0" ]; then
-          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file "$body"
-        fi
+        post() {
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate \
+            --jq '[.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- rigseal -->")))][0].id // empty') || return 1
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$existing" -F "body=@$body" > /dev/null
+          elif [ "$CODE" != "0" ]; then
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file "$body"
+          fi
+        }
+        # A pull request from a fork gets a read-only token. The check result must still decide the job, not this step.
+        post || echo "::warning::rigseal could not post its comment (pull requests from forks get a read-only token). The result is in the log above."
 
     - shell: bash
       env:

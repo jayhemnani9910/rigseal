@@ -14,7 +14,7 @@ from pathlib import PurePath
 from rigseal.capabilities import hidden_chars
 from rigseal.lock import item_key
 from rigseal.model import Finding, Item
-from rigseal.text_rules import text_findings
+from rigseal.text_rules import followed_by, text_findings
 
 SEVERITIES = ("high", "medium", "low")
 
@@ -27,6 +27,7 @@ BASE_URL_ENV = re.compile(r"(_BASE_URL|_API_URL|_ENDPOINT|^HTTPS?_PROXY|^ALL_PRO
 # Bash, Bash(*), and a shell as the command prefix, which also allows any command: Bash(bash:*), Bash(sh *).
 BROAD_BASH = re.compile(rf"^Bash(\((\*|\*\*|\*:\*|({'|'.join(re.escape(s) for s in sorted(SHELLS))})[: ]\*)\))?$")
 NOT_POSIX = {"pwsh", "powershell", "cmd", "cmd.exe"}  # their long single-dash flags aren't clusters
+CURL_PIPE_SH = re.compile(followed_by(r"\b(curl|wget)\b", r"\|\s*(ba|z|da)?sh\b", r"[^|]"))
 C_CLUSTER = re.compile(r"^-[a-zA-Z]*c[a-zA-Z]*$")  # bash -lc, sh -xc, python3 -uc
 E_CLUSTER = re.compile(r"^-[a-zA-Z]*e[a-zA-Z]*$")  # perl -ne, ruby -pe
 
@@ -76,7 +77,7 @@ def r2_risky_stdio(item: Item) -> list[Finding]:
     if (name := base.rstrip("0123456789.")) in INTERPRETERS and _runs_inline_code(name, args):
         hit(f"MCP server runs inline {base} code")
     joined = " ".join([cmd, *args])
-    if re.search(r"\b(curl|wget)\b[^|]*\|\s*(ba|z|da)?sh\b", joined):
+    if CURL_PIPE_SH.search(joined):
         hit("MCP server pipes a download into a shell (curl | sh)")
     if str(cmd).startswith(TEMP_DIRS):
         hit("MCP server binary lives in a temp folder")

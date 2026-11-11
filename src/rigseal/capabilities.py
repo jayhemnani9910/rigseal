@@ -27,7 +27,7 @@ MAX_BYTES = 512 * 1024
 # Vendored code: still hashed (so any change is drift), but not read for capabilities.
 SKIP_DIRS = {"node_modules", ".venv", "venv", "site-packages", "__pycache__", ".git"}
 
-FENCE = re.compile(r"```([\w+-]*)[^\n]*\n(.*?)```", re.S)
+FENCE = re.compile(r"```([\w+-]*+)[^`\n]*\n(.*?)```", re.S)
 SHELL_FENCES = {"bash", "sh", "shell", "zsh", "console", "shellscript", "powershell", "ps1"}
 BANG_COMMAND = re.compile(r"!`[^`\n]+`")  # Claude Code commands run !`cmd` before the prompt
 SHELL_IN_CODE = re.compile(r"\b(subprocess|os\.system|os\.popen|child_process|execSync|spawnSync|Runtime\.exec)\b")
@@ -72,11 +72,31 @@ def frontmatter(text: str) -> dict[str, list[str]]:
     for line in text[3:end].splitlines():
         if m := re.match(r"^([\w-]+):\s*(.*)$", line):
             current, value = m.group(1), m.group(2).strip()
-            value = value.strip("[]")
-            out[current] = [v.strip().strip("\"'") for v in re.split(r"[,\s]+(?![^(]*\))", value) if v.strip()]
+            out[current] = [v.strip("\"'") for v in _split_items(value.strip("[]"))]
         elif current and (m := re.match(r"^\s+-\s*(.+)$", line)):
             out[current].append(m.group(1).strip().strip("\"'"))
     return out
+
+
+def _split_items(value: str) -> list[str]:
+    """Split on commas and spaces, but not inside parentheses: `Bash(git status), Read` is two items.
+    A comma or space is inside a pair when the next parenthesis after it is a closing one."""
+    inside, closing = [False] * len(value), False
+    for i in range(len(value) - 1, -1, -1):
+        inside[i] = closing
+        if value[i] in "()":
+            closing = value[i] == ")"
+    items, start = [], None
+    for i, ch in enumerate(value):
+        if (ch == "," or ch.isspace()) and not inside[i]:
+            if start is not None:
+                items.append(value[start:i])
+                start = None
+        elif start is None:
+            start = i
+    if start is not None:
+        items.append(value[start:])
+    return items
 
 
 def _read(path: Path) -> str | None:

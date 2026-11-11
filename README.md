@@ -19,7 +19,7 @@ rigseal setup
 
 `setup` shows what it will do and asks first. It adds the hooks and locks what your agents load today.
 
-To look first, this reads files and changes nothing:
+To look first. This only reads your agent files (it keeps a cache in `~/.cache/rigseal`):
 
 ```sh
 uvx --from git+https://github.com/jayhemnani9910/rigseal rigseal status
@@ -42,9 +42,9 @@ git restore .mcp.json
 ## How it works
 
 1. `setup` hashes everything your agents load into two locks. `rigseal.lock` is for the repo, commit it. `~/.rigseal/machine.lock` stays on your laptop.
-2. Hooks check those locks when a session starts and before every MCP call. A changed server gets denied. Other changes get reported.
+2. Hooks check those locks when a session starts and before every MCP call. A changed server gets denied. Other changes get reported. If the check itself fails, the call is denied too.
 3. If you have an SSH signing key, the locks are signed. A lock that fails its signature approves nothing.
-4. `approve` needs a person at a terminal, so your agent can't run it for you.
+4. `approve` asks a person at a terminal. That stops an agent approving by accident, not a determined one.
 
 ## Agents
 
@@ -71,7 +71,7 @@ git restore .mcp.json
 
 ## On a team
 
-Commit `rigseal.lock`. This fails any PR that changes agent config without approving it:
+Commit `rigseal.lock`. If rigseal signs it for you, also commit `rigseal.lock.sig` and a `.rigseal/allowed_signers` file that lists the team's keys ([format](docs/reference.md#signing)). This fails any PR that changes agent config without approving it:
 
 ```yaml
 on: pull_request
@@ -91,6 +91,8 @@ jobs:
 - rigseal only reads files. It never runs an MCP server and never prints secret values.
 - The scan rules are a helper. On a public benchmark they catch [2.7% of malicious skills](docs/eval.md). The lock is the product.
 - Approvals are only as safe as a signing key your agent can't use. See the [threat model](docs/threat-model.md).
+- A repo you clone can bring its own `rigseal.lock`, and rigseal takes it as approved. Run `rigseal scan` in a clone you don't know yet.
+- rigseal pins what the config says. It does not hash the script a local MCP server runs, or every file an agent can load ([what is not read yet](docs/reference.md#not-read-yet)).
 - claude.ai connectors live on your account, not on disk, so rigseal can't see them.
 
 Rules, manual hook setup, signing and every path it reads: [docs/reference.md](docs/reference.md).

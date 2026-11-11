@@ -257,3 +257,150 @@ def test_identity_ignores_missing_cwd(tmp_path):
     from rigseal.signing import identity
 
     assert identity(tmp_path / "nope") == "dev@example.com"
+
+
+# --- hostile repos and odd states ---------------------------------------------
+
+
+def test_names_cannot_drive_the_terminal_or_fake_lines(env):
+    """A repo picks its server and file names. Escape codes, new lines and bidi marks are shown, not obeyed."""
+    _, project = env
+    cli(env, "init", "--no-sign")
+    name = "ok\x1bc\x1b[2K\rfake\n+ nothing else changed\u202e"
+    write(project / ".mcp.json", json.dumps({"mcpServers": {"db": {"command": "db-mcp"}, name: {"command": "x"}}}))
+    r = cli(env, "diff")
+    assert "\x1b" not in r.output and "\u202e" not in r.output and "\n+ nothing else changed" not in r.output
+    assert "\\x1bc" in r.output and "\\n+ nothing else changed" in r.output and "\\u202e" in r.output
+
+
+def test_repo_lock_must_be_a_plain_file(env):
+    _, project = env
+    (project / "rigseal.lock").symlink_to("/dev/zero")  # would be read until memory runs out
+    r = cli(env, "check", "--repo")
+    assert r.exit_code == 2 and "not a regular file" in r.output
+
+
+def test_repo_lock_holds_project_entries_only(env):
+    _, project = env
+    cli(env, "init", "--no-sign")
+    lock = json.loads((project / "rigseal.lock").read_text())
+    lock["items"]["claude-code/user/settings/settings.json"] = {"kind": "settings", "sha256": "0"}
+    write(project / "rigseal.lock", json.dumps(lock))
+    r = cli(env, "check")
+    assert r.exit_code == 2 and "project-level" in r.output
+
+
+@pytest.mark.parametrize("caps", [{"hosts": [["a"]]}, {"hidden_chars": ["x"]}, {"shell": "yes"}, {"hosts": {"a": 1}}])
+def test_lock_with_odd_capability_values_is_an_error_not_a_crash(env, caps):
+    _, project = env
+    cli(env, "init", "--no-sign")
+    lock = json.loads((project / "rigseal.lock").read_text())
+    lock["items"]["claude-code/project/mcp/db"]["details"]["capabilities"] = caps
+    write(project / "rigseal.lock", json.dumps(lock))
+    for command in ("status", "diff", "check"):
+        r = cli(env, command)
+        assert r.exit_code == 2 and "malformed" in r.output, command
+
+
+def test_writing_a_lock_never_goes_through_a_planted_link(env, tmp_path):
+    """A repo can ship a link named rigseal.lock.tmp. Approving must not write into whatever it points at."""
+    _, project = env
+    victim = tmp_path / "victim.json"
+    write(victim, '{"mine": true}')
+    (project / "rigseal.lock.tmp").symlink_to(victim)
+    assert cli(env, "init", "--no-sign").exit_code == 0
+    assert victim.read_text() == '{"mine": true}'
+    assert (project / "rigseal.lock").is_file() and not (project / "rigseal.lock").is_symlink()
+    assert not (project / "rigseal.lock.tmp").exists()
+
+
+def test_approving_a_machine_item_writes_no_repo_lock(env):
+    home, project = env
+    assert cli(env, "init", "--no-sign").exit_code == 0
+    (project / "rigseal.lock").unlink()
+    write(home / ".claude/skills/pdf/SKILL.md", "# pdf v2")
+    assert cli(env, "approve", "claude-code/user/skill/pdf", "--no-sign").exit_code == 0
+    assert not (project / "rigseal.lock").exists()
+    assert "claude-code/project/mcp/db" in cli(env, "diff").output  # the project's own item still waits
+
+
+def test_default_project_is_the_repo_you_are_in(env, monkeypatch):
+    """From a subfolder the commands see the same project as the hook does."""
+    _, project = env
+    (project / ".git").mkdir()
+    cli(env, "init", "--no-sign")
+    write(project / ".mcp.json", json.dumps({"mcpServers": {"db": {"command": "other"}}}))
+    (project / "src/app").mkdir(parents=True)
+    monkeypatch.chdir(project / "src/app")
+    home = env[0]
+    r = run(app, ["diff", "--home", str(home)])
+    assert "claude-code/project/mcp/db" in r.output
+    assert run(app, ["check", "--home", str(home)]).exit_code == 1
+    assert not (project / "src/app/rigseal.lock").exists()
+
+
+@needs_ssh_keygen
+def test_a_lock_that_fails_its_signature_shows_everything_as_pending(env, tmp_path):
+    """diff and approve treat it as the hooks do. Before, they said there was nothing to do, and approving
+    something else re-signed entries nobody had looked at."""
+    home, project = env
+    key = make_key(tmp_path / "id", "dev@example.com")
+    allow(home / ".rigseal/allowed_signers", "dev@example.com", key)
+    assert cli(env, "init", "--key", str(key)).exit_code == 0
+    write(project / ".mcp.json", json.dumps({"mcpServers": {"db": {"command": "db-mcp"}, "evil": {"command": "sh"}}}))
+    lock = json.loads((project / "rigseal.lock").read_text())
+    lock["items"]["claude-code/project/mcp/evil"] = {**lock["items"]["claude-code/project/mcp/db"], "name": "evil"}
+    lock["items"]["claude-code/project/mcp/evil"]["sha256"] = "0" * 64
+    write(project / "rigseal.lock", json.dumps(lock))  # edited by hand: the signature no longer matches
+
+    r = cli(env, "diff")
+    assert "signature:" in r.output and "claude-code/project/mcp/evil" in r.output and "claude-code/project/mcp/db" in r.output
+    r = cli(env, "approve", "--no-sign")
+    assert r.exit_code == 2 and "drop the signature" in r.output  # the emptied lock still counts as signed
+    assert cli(env, "approve", "--key", str(key)).exit_code == 0
+    assert cli(env, "check").exit_code == 0
+
+
+@needs_ssh_keygen
+def test_a_signature_file_must_be_a_plain_small_file(env, tmp_path):
+    home, project = env
+    key = make_key(tmp_path / "id", "dev@example.com")
+    allow(home / ".rigseal/allowed_signers", "dev@example.com", key)
+    assert cli(env, "init", "--key", str(key)).exit_code == 0
+    (project / "rigseal.lock.sig").unlink()
+    (project / "rigseal.lock.sig").symlink_to("/dev/zero")
+    r = cli(env, "check")
+    assert r.exit_code == 1 and "not a signature file" in r.output
+
+
+@needs_ssh_keygen
+def test_approve_warns_when_the_new_signature_will_not_verify(env, tmp_path):
+    """A new key, or another git email, that the signer list doesn't know: say so at once, not at the next denied call."""
+    home, _ = env
+    key = make_key(tmp_path / "id", "dev@example.com")
+    assert cli(env, "init", "--key", str(key)).exit_code == 0  # trusts this key
+    other = make_key(tmp_path / "new", "dev@example.com")
+    write(home / ".claude/skills/pdf/SKILL.md", "# pdf v2")
+    r = cli(env, "approve", "--key", str(other))
+    assert r.exit_code == 0 and "warning:" in r.output and "allowed_signers" in r.output
+
+
+@needs_ssh_keygen
+def test_first_signed_approve_after_an_unsigned_setup_trusts_the_key(env, tmp_path):
+    home, _ = env
+    assert cli(env, "init", "--no-sign").exit_code == 0
+    key = make_key(tmp_path / "id", "dev@example.com")
+    write(home / ".claude/skills/pdf/SKILL.md", "# pdf v2")
+    r = cli(env, "approve", "--key", str(key))
+    assert r.exit_code == 0 and "warning:" not in r.output
+    assert "dev@example.com" in (home / ".rigseal/allowed_signers").read_text()
+    assert cli(env, "check").exit_code == 0
+
+
+def test_a_repo_lock_too_big_to_read_back_is_not_written(env, monkeypatch):
+    from rigseal import lock as lock_module
+
+    _, project = env
+    monkeypatch.setattr(lock_module, "MAX_REPO_LOCK_BYTES", 100)
+    r = cli(env, "init", "--no-sign")
+    assert r.exit_code == 2 and "too many files" in r.output and not (project / "rigseal.lock").exists()

@@ -1,4 +1,5 @@
-"""Add rigseal's hooks to the user's agent config. Only appends: existing settings and hooks are kept."""
+"""Add rigseal's hooks to the user's agent config. It appends its own hooks and brings its own older entries up to
+date; every other setting and hook is kept as it is."""
 
 from __future__ import annotations
 
@@ -14,8 +15,8 @@ CLAUDE_COMMAND = "rigseal hook claude-code"
 CURSOR_COMMAND = "rigseal hook cursor"
 
 
-def _claude(matcher: str) -> dict:
-    return {"matcher": matcher, "hooks": [{"type": "command", "command": CLAUDE_COMMAND, "timeout": 30}]}
+def _claude(matcher: str, **more: object) -> dict:
+    return {"matcher": matcher, "hooks": [{"type": "command", "command": CLAUDE_COMMAND, "timeout": 30, **more}]}
 
 
 @dataclass
@@ -33,7 +34,8 @@ def targets(home: Path) -> list[Target]:
     if (home / ".claude").is_dir():
         wanted = {
             "SessionStart": _claude("startup|resume"),
-            "PreToolUse": _claude("mcp__.*"),
+            # Without onFailure a hook that crashes, times out or can't start lets the call through (Claude Code 2.1.295+).
+            "PreToolUse": _claude("mcp__.*", onFailure="block"),
             "ConfigChange": _claude("user_settings|project_settings|local_settings|skills"),
         }
         found.append(Target("claude-code", home / ".claude" / "settings.json", CLAUDE_COMMAND, wanted, {}))
@@ -48,35 +50,65 @@ def _read(target: Target) -> dict:
     if doc is None:
         return dict(target.base)
     try:
-        json.loads(target.path.read_text().strip() or "{}")
+        json.loads(target.path.read_text(encoding="utf-8-sig").strip() or "{}")
     except ValueError as e:  # read_json accepts comments, but writing the file back would lose them
-        raise CollectError(f"{target.path} has comments or trailing commas, so rigseal won't rewrite it. Add the hooks by hand (see the README).") from e
+        raise CollectError(
+            f"{target.path} has comments or trailing commas, so rigseal won't rewrite it. Add the hooks by hand (see docs/reference.md)."
+        ) from e
     hooks = doc.get("hooks", {})
     if not isinstance(hooks, dict) or not all(isinstance(v, list) for v in hooks.values()):
         raise CollectError(f"{target.path}: `hooks` is not in the expected format, so rigseal won't rewrite it.")
     return doc
 
 
-def _has(entries: list, command: str) -> bool:
-    commands = []
+UP_TO_USER = ("command", "timeout")  # a full path to rigseal or a longer timeout is the user's choice
+
+
+def _ours(entries: list, command: str) -> dict | None:
+    """The hook in an event's list that runs rigseal. Claude Code nests hooks under `hooks`, Cursor lists them flat."""
     for e in entries:
         if isinstance(e, dict):
             nested = e.get("hooks")
-            commands += [h.get("command") for h in (nested if isinstance(nested, list) else [e]) if isinstance(h, dict)]
-    return any(isinstance(c, str) and c.endswith(command) for c in commands)
+            for h in nested if isinstance(nested, list) else [e]:
+                if isinstance(h, dict) and isinstance(h.get("command"), str) and h["command"].endswith(command):
+                    return h
+    return None
+
+
+def _settings(target: Target, event: str) -> dict:
+    """What rigseal's hook for `event` must say besides its command, such as failing closed."""
+    entry = target.wanted[event]
+    hook = entry["hooks"][0] if "hooks" in entry else entry
+    return {k: v for k, v in hook.items() if k not in UP_TO_USER}
 
 
 def missing(target: Target) -> list[str]:
-    """Events that don't call rigseal yet. Raises CollectError if the file can't be safely rewritten."""
+    """Events that don't call rigseal yet, or call it with older settings than it now needs.
+    Raises CollectError if the file can't be safely rewritten."""
     hooks = _read(target).get("hooks", {})
-    return [event for event in target.wanted if not _has(hooks.get(event, []), target.command)]
+    out = []
+    for event in target.wanted:
+        mine = _ours(hooks.get(event, []), target.command)
+        if mine is None or any(mine.get(k) != v for k, v in _settings(target, event).items()):
+            out.append(event)
+    return out
+
+
+def installed(target: Target) -> bool:
+    """True if any event already calls rigseal, so what `missing` reports is an update, not a first install."""
+    hooks = _read(target).get("hooks", {})
+    return any(_ours(hooks.get(event, []), target.command) for event in target.wanted)
 
 
 def add(target: Target) -> None:
     doc = _read(target)
     hooks = doc.setdefault("hooks", {})
     for event in missing(target):
-        hooks.setdefault(event, []).append(target.wanted[event])
+        mine = _ours(hooks.get(event, []), target.command)
+        if mine is None:
+            hooks.setdefault(event, []).append(target.wanted[event])
+        else:
+            mine.update(_settings(target, event))
     _write(target.path, doc)
 
 
@@ -84,7 +116,7 @@ def _write(path: Path, doc: dict) -> None:
     path = path.resolve()  # a symlink into a dotfiles repo stays a symlink
     tmp = path.with_name(path.name + ".rigseal-tmp")
     try:
-        tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+        tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         if path.exists():
             shutil.copymode(path, tmp)
         tmp.replace(path)

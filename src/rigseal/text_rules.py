@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from bisect import bisect_left
 from pathlib import PurePosixPath
 
 from rigseal.lock import item_key
@@ -22,16 +23,28 @@ HOMOGLYPHS = str.maketrans(
     "aeopcyxijsdghlqwABEKMHOPCTXIJSWaoopTuvkiABEZHIKMNOPTYX",
 )
 CYRILLIC = re.compile(r"[\u0400-\u04ff]")  # Greek is left out: math text mixes it with Latin (d-psi-dx)
-MIXED_WORD = re.compile(r"[A-Za-z][^\W\d_]*[\u0400-\u04ff]|[\u0400-\u04ff][^\W\d_]*[A-Za-z]")
+LATIN = re.compile(r"[A-Za-z]")
+LETTER_RUN = re.compile(r"(?:[^\W\d_]|[\u0400-\u04ff])+")  # letters, plus the Cyrillic marks that aren't letters
 
 
 def fold(text: str) -> str:
     return unicodedata.normalize("NFKC", text).translate(HOMOGLYPHS)
 
 
+def mixed_word(text: str) -> bool:
+    """A run of letters that holds both a Latin and a Cyrillic one. Each run is read once, however long it is."""
+    return any(LATIN.search(w) and CYRILLIC.search(w) for w in LETTER_RUN.findall(text) if not w.isascii())
+
+
+def followed_by(first: str, then: str, between: str = r"[^\n]") -> str:
+    """Regex for `first` with `then` further along. The text between can't hold another `first`: the search starts
+    again there instead of reading the rest of the line once more, so a long line of repeats stays cheap."""
+    return rf"(?:{first})(?:(?!{first}){between})*(?:{then})"
+
+
 # Binaries, archives, release assets, paste sites, shorteners, tunnels, raw IPs. Not install scripts: docs use those a lot.
 DOWNLOAD_URL = re.compile(
-    r"https?://[^\s)\]>'\"]*(\.(zip|exe|dmg|pkg|msi|7z|rar|appimage|scr)\b|/releases/download/)|"
+    followed_by(r"https?://", r"\.(zip|exe|dmg|pkg|msi|7z|rar|appimage|scr)\b|/releases/download/", r"[^\s)\]>'\"]") + "|"
     r"https?://(www\.)?(glot\.io|pastebin\.com|paste\.ee|hastebin\.com|transfer\.sh|bit\.ly|tinyurl\.com|[\w-]+\.ngrok\S*|[\w-]+\.trycloudflare\.com)|"
     r"https?://\d{1,3}(\.\d{1,3}){3}",
     re.I,
@@ -45,12 +58,12 @@ PREREQ = re.compile(
 B64_BLOB = re.compile(r"[A-Za-z0-9+/]{60,}={0,2}")
 HEX_BLOB = re.compile(r"(\\x[0-9a-fA-F]{2}){20,}|\b[0-9a-fA-F]{100,}\b")
 DECODE = re.compile(
-    r"base64\s+(-d|--decode|-D)\b|b64decode|atob\s*\(|from\(\s*\S+\s*,\s*['\"]base64|FromBase64String|certutil\s+-decode|"
+    r"base64\s+(-d|--decode|-D)\b|b64decode|atob\s*\(|from\(\s*(?:(?!from\()\S)+\s*,\s*['\"]base64|FromBase64String|certutil\s+-decode|"
     r"bytes\.fromhex|unhexlify|xxd\s+-r|codecs\.decode",
     re.I,
 )
 EXEC_DECODED = re.compile(
-    r"(base64\s+(-d|--decode|-D)|xxd\s+-r|openssl\s+(enc|base64)\s+-d)[^\n|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b|"
+    followed_by(r"base64\s+(-d|--decode|-D)|xxd\s+-r|openssl\s+(enc|base64)\s+-d", r"\|\s*(sudo\s+)?(ba|z|da)?sh\b", r"[^\n|]") + "|"
     r"\b(eval|exec)\s*\(\s*(atob|Buffer\.from|base64|b64decode|codecs|bytes\.fromhex|zlib|marshal|compile)|"
     r"\bexec\s*\(\s*open\s*\(|\beval\s*\(\s*(fs\.)?readFileSync|"
     r"iex\s*\(\s*(New-Object\s+Net\.WebClient|irm|iwr|Invoke-RestMethod|Invoke-WebRequest)|\|\s*iex\b",
@@ -58,15 +71,16 @@ EXEC_DECODED = re.compile(
 )
 # Common in honest install docs, so medium: `curl https://x/install.sh | bash`.
 PIPE_TO_SHELL = re.compile(
-    r"\b(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba|z|da)?sh\b|\b(curl|wget)\b[^\n|]*\|\s*(python3?|perl|ruby|node)\b|"
+    followed_by(r"\b(curl|wget)\b", r"\|\s*((sudo\s+)?(ba|z|da)?sh|python3?|perl|ruby|node)\b", r"[^\n|]") + "|"
     r"(eval|source)\s+\"?\$\(\s*(curl|wget)|source\s+<\(\s*(curl|wget)",
     re.I,
 )
 ARCHIVE = re.compile(r"\.(zip|rar|7z)\b|\b(zip|archive|rar|7z|7-zip)\b", re.I)
 ARCHIVE_PASSWORD = re.compile(r"\b(password|passcode)\b\s*(is|[:=])\s*[`'\"*]*\S{3,}", re.I)
 REVERSE_SHELL = re.compile(
-    r"/dev/(tcp|udp)/|\bn(c|cat|etcat)\b[^\n]*\s-(e|c)\s|bash\s+-i\s*>&|\bsh\s+-i\s*[<>]&|mkfifo[^\n]*\bn(c|cat)\b|"
-    r"socat\b[^\n]*exec:|pty\.spawn\s*\(|os\.dup2\s*\(\s*\w+\.fileno\(\)",
+    r"/dev/(tcp|udp)/|" + followed_by(r"\bn(c|cat|etcat)\b", r"\s-(e|c)\s") + r"|bash\s+-i\s*>&|\bsh\s+-i\s*[<>]&|"
+    + followed_by("mkfifo", r"\bn(c|cat)\b") + "|" + followed_by(r"socat\b", "exec:")
+    + r"|pty\.spawn\s*\(|os\.dup2\s*\(\s*\w+\.fileno\(\)",
     re.I,
 )
 PY_SOCKET_SHELL = (re.compile(r"socket\.socket\s*\("), re.compile(r"os\.dup2|pty\.spawn|stdin\s*=\s*\w+\.(fileno|makefile)"))
@@ -76,7 +90,7 @@ STRONG_SECRETS = re.compile(
     re.I,
 )
 NETWORK_CALL = re.compile(r"\b(curl|wget|Invoke-WebRequest|requests\.(get|post|put)|urllib\.request|httpx\.|fetch\(|axios\.|nc\s)")
-FENCE = re.compile(r"```[^\n]*\n(.*?)```", re.S)
+FENCE = re.compile(r"```[^`\n]*\n(.*?)```", re.S)
 CODE_SUFFIXES = {".sh", ".bash", ".zsh", ".ps1", ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl"}
 
 BINARY_SUFFIXES = {".exe", ".dll", ".so", ".dylib", ".bin", ".elf", ".scr", ".com", ".msi", ".app", ".jar", ".pyc", ".node"}
@@ -124,9 +138,12 @@ def file_hits(text: str, suffix: str) -> tuple[tuple[str, str, str], ...]:
 
     # R9: password-protected archive, password given next to it.
     if _search(ARCHIVE_PASSWORD, f, low):
-        archives = [a.start() for a in ARCHIVE.finditer(f)]
-        if any(abs(a - m.start()) < 300 for m in ARCHIVE_PASSWORD.finditer(f) for a in archives):
-            hits.append(("R9", "medium", "password-protected archive with the password in the text"))
+        archives = [a.start() for a in ARCHIVE.finditer(f)]  # in order, so the nearest one is a binary search away
+        for m in ARCHIVE_PASSWORD.finditer(f):
+            i = bisect_left(archives, m.start() - 299)
+            if i < len(archives) and archives[i] < m.start() + 300:
+                hits.append(("R9", "medium", "password-protected archive with the password in the text"))
+                break
 
     # R10: reverse shell.
     if _search(REVERSE_SHELL, f, low) or ("socket" in low and all(p.search(f) for p in PY_SOCKET_SHELL)):
@@ -139,7 +156,7 @@ def file_hits(text: str, suffix: str) -> tuple[tuple[str, str, str], ...]:
             hits.append(("R11", "high", f"code touches secrets ({m.group(0)}) and makes a network call"))
 
     # R13: words that mix Latin and Cyrillic letters. Checked before folding, which would hide them.
-    if CYRILLIC.search(text) and MIXED_WORD.search(unicodedata.normalize("NFKC", text)):
+    if CYRILLIC.search(text) and mixed_word(unicodedata.normalize("NFKC", text)):
         hits.append(("R13", "high", "words mixing Latin and Cyrillic letters"))
 
     # R14: decode, then run. Piping a download into a shell is common in honest docs, so only medium.

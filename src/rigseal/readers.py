@@ -28,7 +28,7 @@ def read_json(path: Path) -> dict | None:
             raise CollectError(f"{path} is not a regular file; not reading it")
         if path.stat().st_size > MAX_CONFIG_BYTES:
             raise CollectError(f"{path} is over {MAX_CONFIG_BYTES // 2**20} MB; not reading it")
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8-sig")  # some editors on Windows save JSON with a byte order mark
     except FileNotFoundError:
         return None
     except (OSError, UnicodeDecodeError) as e:
@@ -57,5 +57,5 @@ def read_toml(path: Path) -> dict | None:
             return tomllib.load(f)
     except FileNotFoundError:
         return None
-    except (OSError, UnicodeDecodeError, RecursionError, tomllib.TOMLDecodeError) as e:
+    except (OSError, ValueError, RecursionError) as e:  # ValueError covers bad TOML, bad UTF-8 and absurd numbers
         raise CollectError(f"cannot read {path}: {e}") from e

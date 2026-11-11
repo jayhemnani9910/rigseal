@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -69,6 +71,8 @@ def hash_bytes(data: bytes) -> str:
 
 
 def hash_file(path: Path) -> str:
+    if not _files:
+        return ""
     h = hashlib.sha256()
     try:
         with path.open("rb") as f:
@@ -96,9 +100,38 @@ class Tree:
     truncated: bool = False  # hit MAX_TREE_FILES or MAX_TREE_BYTES; the hash covers what was read
 
 
+_scan: dict[tuple[str, frozenset[str]], Tree] | None = None
+_files = True
+
+
+@contextmanager
+def one_scan(files: bool = True) -> Iterator[None]:
+    """Inside one scan a folder is hashed once, however many items point at it. A repo can link one big folder
+    under a hundred names, and each name would otherwise cost a full pass.
+    With `files` off nothing is hashed at all: the scan only says what the config files hold. That is all the MCP
+    gate needs, and it keeps a slow or hostile folder from holding up every tool call."""
+    global _scan, _files
+    _scan, _files = {}, files
+    try:
+        yield
+    finally:
+        _scan, _files = None, True
+
+
 def hash_tree(root: Path, ignore: frozenset[str] = frozenset()) -> Tree:
     """Hash every file under root, dotfiles included. Symlinks are recorded by target, not followed.
     Names in `ignore` (files or folders) are skipped, for agent bookkeeping that changes every session."""
+    if not _files:
+        return Tree("", [])
+    if _scan is None:
+        return _hash_tree(root, ignore)
+    key = (os.path.realpath(root), ignore)
+    if key not in _scan:
+        _scan[key] = _hash_tree(root, ignore)
+    return _scan[key]
+
+
+def _hash_tree(root: Path, ignore: frozenset[str]) -> Tree:
     files: list[FileHash] = []
     total = 0
     for dirpath, dirnames, filenames in os.walk(root):

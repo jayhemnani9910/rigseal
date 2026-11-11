@@ -27,6 +27,6 @@ Real benign skills: 35 from anthropics-skills `2c5958ecac7c`, obra-superpowers `
 
 Cisco skill-scanner reports on the same frozen test split (839 malicious, 545 benign): rules alone 7.7% recall at HIGH with 4.0% false positives; with a Gemma 4 26B judge, 66.7% at MEDIUM+ (15.4% FPR) and 33.7% at HIGH (6.4% FPR). [Source](https://github.com/cisco-ai-defense/skill-scanner#measured-results). Not rerun here.
 
-Rules alone miss most of this benchmark: many malicious samples describe the attack in prose with no code to match. Off-the-shelf prompt-injection classifiers do not close that gap ([docs/eval-classifier.md](eval-classifier.md)); the local judge (week 8) is meant to. The lockfile does not depend on detection: any change is drift.
+Rules alone miss most of this benchmark: many malicious samples describe the attack in prose with no code to match. Off-the-shelf prompt-injection classifiers do not close that gap ([docs/eval-classifier.md](eval-classifier.md)); a local judge is meant to. The lockfile does not depend on detection: any change is drift.
 
 Rules were tuned on the `train` split only; `test` is for reporting. Reproduce: `uv run --group eval python evals/fetch.py && uv run --group eval python evals/run.py --split test`.

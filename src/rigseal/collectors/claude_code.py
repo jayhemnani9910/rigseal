@@ -44,6 +44,7 @@ def collect(home: Path, project: Path | None) -> list[Item]:
     items += _synced_skills(claude_dir / "skills" / "synced")
     items += files_matching(claude_dir / "commands", ".md", "command", "user")
     items += files_matching(claude_dir / "agents", ".md", "agent", "user")
+    items += files_matching(claude_dir / "rules", ".md", "rule", "user")
     items += _plugins(claude_dir / "plugins" / "installed_plugins.json")
     items += _synced_plugins(claude_dir / "plugins" / "synced")
 
@@ -56,8 +57,10 @@ def collect(home: Path, project: Path | None) -> list[Item]:
         items += skill_dirs(pc / "skills", "project", within=project)
         items += files_matching(pc / "commands", ".md", "command", "project", within=project)
         items += files_matching(pc / "agents", ".md", "agent", "project", within=project)
+        items += files_matching(pc / "rules", ".md", "rule", "project", within=project)
         for name, scope in (("CLAUDE.md", "project"), ("CLAUDE.local.md", "local"), ("AGENTS.md", "project")):
             items += optional_file(project / name, scope, "instructions", within=project)
+        items += optional_file(pc / "CLAUDE.md", "project", "instructions", within=project, name=".claude/CLAUDE.md")
     return items
 
 
@@ -73,8 +76,9 @@ def _user_mcp(path: Path, project: Path | None) -> list[Item]:
     if data is None:
         return []
     items = mcp_items(data.get("mcpServers"), "user", path)
-    if project is not None:
-        proj = (data.get("projects") or {}).get(str(project)) or {}
+    projects = data.get("projects")
+    proj = projects.get(str(project)) if project is not None and isinstance(projects, dict) else None
+    if isinstance(proj, dict):
         items += mcp_items(proj.get("mcpServers"), "local", path)
     return items
 
@@ -84,18 +88,22 @@ def _plugins(path: Path) -> list[Item]:
     if data is None:
         return []
     items = []
-    for name, installs in sorted((data.get("plugins") or {}).items()):
-        for inst in installs or []:
-            install_path = Path(inst.get("installPath", ""))
+    plugins = data.get("plugins")
+    for name, installs in sorted(plugins.items()) if isinstance(plugins, dict) else []:
+        for inst in installs if isinstance(installs, list) else [installs]:  # the first file format had one record, not a list
+            if not isinstance(inst, dict):
+                continue
+            where = inst.get("installPath")
             details = {"version": inst.get("version"), "plugin_scope": inst.get("scope")}
             if inst.get("gitCommitSha"):
                 details["git_commit"] = inst["gitCommitSha"]
-            if install_path.is_dir():
-                items.append(common.tree_item(AGENT, install_path, "plugin", "plugin", name, details))
-                items += common.plugin_mcp(AGENT, install_path, name.split("@")[0])
+            # No path, or a relative one, would hash whatever folder rigseal was started in.
+            if isinstance(where, str) and Path(where).is_absolute() and Path(where).is_dir():
+                items.append(common.tree_item(AGENT, Path(where), "plugin", "plugin", name, details))
+                items += common.plugin_mcp(AGENT, Path(where), name.split("@")[0])
             else:
                 details["missing"] = True
-                items.append(Item(AGENT, "plugin", "plugin", name, str(install_path), tree_digest([]), [], details))
+                items.append(Item(AGENT, "plugin", "plugin", name, where if isinstance(where, str) else "", tree_digest([]), [], details))
     return items
 
 
@@ -104,8 +112,8 @@ def _synced_plugins(root: Path) -> list[Item]:
     if not root.is_dir():
         return []
     items = []
-    for account in sorted(p for p in root.iterdir() if p.is_dir()):
-        for d in sorted(p for p in account.iterdir() if (p / ".claude-plugin").is_dir()):
+    for account in (p for p in common.children(root) if p.is_dir()):
+        for d in (p for p in common.children(account) if (p / ".claude-plugin").is_dir()):
             manifest = read_json(d / ".claude-plugin" / "plugin.json") or {}
             name = str(manifest.get("name") or d.name.split("~")[0])
             items.append(common.tree_item(AGENT, d, "plugin", "plugin", name, {"source": "synced"}, SYNCED_PLUGIN_IGNORE))
@@ -118,6 +126,6 @@ def _synced_skills(root: Path) -> list[Item]:
     if not root.is_dir():
         return []
     items = []
-    for account in sorted(p for p in root.iterdir() if p.is_dir()):
-        items += [common.skill_item(AGENT, d, "synced") for d in sorted(account.iterdir()) if d.is_dir()]
+    for account in (p for p in common.children(root) if p.is_dir()):
+        items += [common.skill_item(AGENT, d, "synced") for d in common.children(account) if d.is_dir()]
     return items
